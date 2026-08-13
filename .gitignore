@@ -1,0 +1,17 @@
+# Build output
+exe/
+intermediate/
+.vs/
+*.exe
+*.pdb
+*.ilk
+*.obj
+*.res
+*.tlog
+*.user
+
+# Data and results
+data/
+runs/
+*.csv
+*.zip
