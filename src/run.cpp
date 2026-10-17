@@ -13,7 +13,9 @@ bool ensure_directory(const std::string& path, std::string* error)
 	std::error_code code;
 	fs::create_directories(fs::path(path), code);
 
-	if (code && !fs::exists(fs::path(path)))
+	// An existing file is not a directory: `walk --out file.txt` once reported
+	// "refusing to overwrite run directory file.txt/<id>".
+	if (code && !fs::is_directory(fs::path(path)))
 	{
 		if (error) *error = "cannot create " + path + ": " + code.message();
 		return false;
@@ -33,6 +35,7 @@ std::string make_run_id(const std::string& agent, const uint64_t seed)
 	std::string id = buf;
 	std::replace(id.begin(), id.end(), ' ', '-');
 	id.erase(std::remove(id.begin(), id.end(), ':'), id.end());
+	id += "-m" + std::to_string(ms % 1000);
 	id += "-s" + std::to_string(seed);
 
 	return id;
@@ -41,7 +44,14 @@ std::string make_run_id(const std::string& agent, const uint64_t seed)
 bool run_writer::open(const std::string& root, const std::string& id, std::string* error)
 {
 	directory_ = root + "/" + id;
-	return ensure_directory(directory_, error);
+	if (!ensure_directory(root, error)) return false;
+	std::error_code code;
+	if (!fs::create_directory(directory_, code))
+	{
+		if (error) *error = "refusing to overwrite run directory " + directory_ + ": " + code.message();
+		return false;
+	}
+	return true;
 }
 
 void run_writer::set(const std::string& key, const std::string& value)
@@ -74,41 +84,53 @@ void run_writer::set(const std::string& key, const xfloat value)
 	set(key, std::string(buf));
 }
 
+bool run_writer::track(const bool written)
+{
+	if (!written) failed_ = true;
+	return written;
+}
+
 bool run_writer::write_manifest()
 {
 	std::ofstream file(path("manifest.txt"), std::ios::trunc);
-	if (!file) return false;
+	if (!file) return track(false);
 
 	for (const manifest_entry& e : entries_) file << e.key << '=' << e.value << '\n';
-	return true;
+	file.close();
+	return track(file.good());
 }
 
 bool run_writer::write_equity(const trade_log& log)
 {
 	std::ofstream file(path("equity.csv"), std::ios::trunc);
-	if (!file) return false;
+	if (!file) return track(false);
 
 	file << "time,price,position,gross,cost,equity\n";
 	for (size_t i = 0; i < log.size(); i += 1)
 	{
 		char buf[192];
-		snprintf(buf, sizeof buf, "%lld,%.8f,%d,%.10f,%.10f,%.10f",
+		const char* format = log.elapsed_ms[i] > 0
+			? "%lld,%.17g,%d,%.10f,%.10f,%.10f"
+			: "%lld,%.8f,%d,%.10f,%.10f,%.10f";
+		snprintf(buf, sizeof buf, format,
 			static_cast<long long>(log.time[i]), log.price[i], log.position[i],
 			log.gross[i], log.cost[i], log.equity[i]);
 		file << buf << '\n';
 	}
 
-	return true;
+	file.close();
+	return track(file.good());
 }
 
 bool run_writer::write_metrics_header()
 {
 	std::ofstream file(path("metrics.csv"), std::ios::trunc);
-	if (!file) return false;
+	if (!file) return track(false);
 
 	file << "variant,seed,cost_bps,fold," << metrics_header() << '\n';
+	file.close();
 	metrics_started_ = true;
-	return true;
+	return track(file.good());
 }
 
 bool run_writer::append_metrics(const std::string& variant, const int seed, const xfloat cost_bps,
@@ -117,19 +139,20 @@ bool run_writer::append_metrics(const std::string& variant, const int seed, cons
 	if (!metrics_started_ && !write_metrics_header()) return false;
 
 	std::ofstream file(path("metrics.csv"), std::ios::app);
-	if (!file) return false;
+	if (!file) return track(false);
 
 	char prefix[128];
 	snprintf(prefix, sizeof prefix, "%s,%d,%.2f,%d,", variant.c_str(), seed, cost_bps, fold);
 	file << prefix << metrics_row(m) << '\n';
-	return true;
+	file.close();
+	return track(file.good());
 }
 
 bool run_writer::append_learning(const int episode, const xfloat mean_reward, const xfloat epsilon, const xfloat loss)
 {
 	const bool first = !learning_started_;
 	std::ofstream file(path("learning.csv"), first ? std::ios::trunc : std::ios::app);
-	if (!file) return false;
+	if (!file) return track(false);
 
 	if (first)
 	{
@@ -140,7 +163,8 @@ bool run_writer::append_learning(const int episode, const xfloat mean_reward, co
 	char buf[128];
 	snprintf(buf, sizeof buf, "%d,%.10f,%.6f,%.10f", episode, mean_reward, epsilon, loss);
 	file << buf << '\n';
-	return true;
+	file.close();
+	return track(file.good());
 }
 
 std::string run_summary::get(const std::string& key) const

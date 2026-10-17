@@ -128,6 +128,59 @@ private:
 	int count_ = 0;
 };
 
+// Tracks the UTC session. The previous day's levels only become readable once
+// that day has closed, so a rollover is the only thing that can publish them.
+class daily_levels
+{
+public:
+	void push(const bar& b)
+	{
+		push(b, b.time / 86400000);
+	}
+
+	void push(const bar& b, const int64_t day)
+	{
+		if (day != day_)
+		{
+			if (started_)
+			{
+				previous_high_ = high_;
+				previous_low_ = low_;
+				previous_close_ = close_;
+				has_previous_ = true;
+			}
+
+			day_ = day;
+			high_ = b.high;
+			low_ = b.low;
+			started_ = true;
+		}
+		else
+		{
+			if (b.high > high_) high_ = b.high;
+			if (b.low < low_) low_ = b.low;
+		}
+
+		close_ = b.close;
+	}
+
+	bool ready() const { return has_previous_; }
+	xfloat previous_high() const { return previous_high_; }
+	xfloat previous_low() const { return previous_low_; }
+	xfloat previous_close() const { return previous_close_; }
+
+	// Includes the bar just pushed, which is known at that bar's close.
+	xfloat day_high() const { return high_; }
+	xfloat day_low() const { return low_; }
+
+private:
+	int64_t day_ = INT64_MIN;
+	bool started_ = false;
+	bool has_previous_ = false;
+	xfloat high_ = 0.0, low_ = 0.0, close_ = 0.0;
+	xfloat previous_high_ = 0.0, previous_low_ = 0.0, previous_close_ = 0.0;
+};
+
 // Trailing mean and variance over everything seen so far. Whole-file statistics
 // would leak the future; this cannot, because it only ever sees the past.
 class expanding_stats
@@ -155,27 +208,31 @@ struct feature_matrix
 {
 	int columns = 0;
 	int warmup = 0;               // rows before this index are not usable
+	std::string profile;
 	std::vector<std::string> names;
 	std::vector<xfloat> data;     // row-major, columns wide
 
 	const xfloat* row(const size_t i) const { return &data[i * columns]; }
 	size_t rows() const { return columns > 0 ? data.size() / columns : 0; }
+	int column(const std::string& name) const;
+	std::string schema() const;
 };
 
 // Base observation, before the environment appends the agent's own position.
 class feature_builder
 {
 public:
-	explicit feature_builder(int64_t interval_ms);
+	explicit feature_builder(int64_t interval_ms, bool price_only = false);
 
-	void push(const bar& b, std::vector<xfloat>& out);
+	void push(const bar& b, std::vector<xfloat>& out, int64_t session);
 
-	static const std::vector<std::string>& base_names();
-	static int base_count();
+	static const std::vector<std::string>& base_names(bool price_only = false);
+	static int base_count(bool price_only = false);
 	int warmup() const { return warmup_; }
 
 private:
 	int64_t interval_ms_;
+	bool price_only_;
 	int warmup_;
 	int64_t seen_ = 0;
 
@@ -186,6 +243,8 @@ private:
 	rolling_sum volume_, buy_volume_, trade_count_;
 	ema_line trade_rate_;
 	rolling_extremes range_;
+	daily_levels levels_;
+	std::vector<expanding_stats> hourly_activity_;
 	std::vector<expanding_stats> stats_;
 	xfloat previous_close_ = 0.0;
 };

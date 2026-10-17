@@ -34,11 +34,18 @@ public:
 	const std::string& directory() const { return directory_; }
 	std::string path(const std::string& file) const { return directory_ + "/" + file; }
 
+	// False once any artifact write has failed. Appends are not checked one by
+	// one, so this is what keeps a truncated metrics.csv from reporting success.
+	bool ok() const { return !failed_; }
+
 private:
+	bool track(bool written);
+
 	std::string directory_;
 	std::vector<manifest_entry> entries_;
 	bool metrics_started_ = false;
 	bool learning_started_ = false;
+	bool failed_ = false;
 };
 
 struct run_summary

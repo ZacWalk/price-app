@@ -1,4 +1,5 @@
 # Build output
+build/
 exe/
 intermediate/
 .vs/
@@ -9,6 +10,11 @@ intermediate/
 *.res
 *.tlog
 *.user
+debug_trace.log
+tmp/
+.dd/state/
+CMakeUserPresets.json
+vcpkg_installed/
 
 # Data and results
 data/

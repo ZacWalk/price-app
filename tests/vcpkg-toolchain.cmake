@@ -1,0 +1,37 @@
+cmake_minimum_required(VERSION 3.24)
+if(NOT WRAPPER OR NOT TEST_ROOT)
+    message(FATAL_ERROR "WRAPPER and TEST_ROOT are required")
+endif()
+file(TO_CMAKE_PATH "${TEST_ROOT}" TEST_ROOT)
+set(ci_root "${TEST_ROOT}/CI selected root")
+set(vs_root "${TEST_ROOT}/VS fallback root")
+foreach(root IN ITEMS "${ci_root}" "${vs_root}")
+    file(MAKE_DIRECTORY "${root}/scripts/buildsystems")
+    file(WRITE "${root}/scripts/buildsystems/vcpkg.cmake"
+        "if(NOT \"\$ENV{VCPKG_ROOT}\" STREQUAL \"${root}\")\n"
+        "  message(FATAL_ERROR \"Selected root was not propagated to the CMake environment\")\n"
+        "endif()\nfile(WRITE \"${TEST_ROOT}/selected.txt\" \"${root}\")\n")
+endforeach()
+function(check_case name ci fallback expected error)
+    file(WRITE "${TEST_ROOT}/selected.txt" "")
+    execute_process(COMMAND "${CMAKE_COMMAND}" -E env
+        "CI_VCPKG_ROOT=${ci}" "VCPKG_ROOT=${fallback}"
+        "${CMAKE_COMMAND}" ${ARGN} -P "${WRAPPER}"
+        RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE diagnostic)
+    if(expected)
+        file(READ "${TEST_ROOT}/selected.txt" selected)
+        if(NOT result EQUAL 0 OR NOT selected STREQUAL expected)
+            message(FATAL_ERROR "${name}: wrong selected root (${selected}): ${output}${diagnostic}")
+        endif()
+    elseif(result EQUAL 0 OR NOT "${output}${diagnostic}" MATCHES "${error}")
+        message(FATAL_ERROR "${name}: expected explicit failure: ${output}${diagnostic}")
+    endif()
+endfunction()
+check_case(ci-precedence "${ci_root}" "${vs_root}" "${ci_root}" "")
+check_case(local-fallback "" "${vs_root}" "${vs_root}" "")
+check_case(invalid-ci "${TEST_ROOT}/missing" "${vs_root}" "" "has no toolchain")
+check_case(relative-ci "relative-root" "${vs_root}" "" "absolute vcpkg root")
+check_case(missing-roots "" "" "" "absolute vcpkg root")
+check_case(stale-cache "${ci_root}" "${vs_root}" "" "Cached vcpkg root differs" "-DZ_VCPKG_ROOT_DIR=${vs_root}")
+check_case(matching-cache "${ci_root}" "${vs_root}" "${ci_root}" "" "-DZ_VCPKG_ROOT_DIR=${ci_root}")
+message(STATUS "PASS 7 actual vcpkg toolchain root-selection cases")

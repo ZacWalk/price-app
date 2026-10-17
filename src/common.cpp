@@ -1,7 +1,9 @@
 #include "common.h"
 
+#include <cerrno>
 #include <cstdio>
 #include <ctime>
+#include <limits>
 
 std::string hex64(const uint64_t v)
 {
@@ -48,9 +50,10 @@ bool parse_real(const std::string& s, xfloat& out)
 	const std::string t = trim(s);
 	if (t.empty()) return false;
 
+	// The whole token must be the number: "0.5x" or "0.9.9" is a typo, not 0.5 or 0.9.
 	char* end = nullptr;
 	const double v = strtod(t.c_str(), &end);
-	if (end == t.c_str()) return false;
+	if (end == t.c_str() || *end) return false;
 
 	out = v;
 	return true;
@@ -65,23 +68,31 @@ int64_t parse_duration_ms(const std::string& s)
 	while (digits < t.size() && t[digits] >= '0' && t[digits] <= '9') digits += 1;
 	if (digits == 0) return 0;
 
+	errno = 0;
 	const int64_t value = strtoll(t.substr(0, digits).c_str(), nullptr, 10);
 	const std::string unit = t.substr(digits);
 
-	if (unit.empty() || unit == "ms") return value;
-	if (unit == "s") return value * 1000;
-	if (unit == "m") return value * 60 * 1000;
-	if (unit == "h") return value * 60 * 60 * 1000;
-	if (unit == "d") return value * 24 * 60 * 60 * 1000;
+	int64_t scale = 0;
+	if (unit.empty() || unit == "ms") scale = 1;
+	else if (unit == "s") scale = 1000;
+	else if (unit == "m") scale = 60 * 1000;
+	else if (unit == "h") scale = 60 * 60 * 1000;
+	else if (unit == "d") scale = 24 * 60 * 60 * 1000;
 
-	return 0;
+	// Too large is invalid, never wrapped: 106751991167d once became one bar in 1970.
+	if (scale == 0 || errno == ERANGE || value > std::numeric_limits<int64_t>::max() / scale) return 0;
+	return value * scale;
 }
 
 std::string format_time_ms(const int64_t ms)
 {
 	const time_t seconds = static_cast<time_t>(ms / 1000);
 	tm parts = {};
+#ifdef _WIN32
 	if (gmtime_s(&parts, &seconds) != 0) return "?";
+#else
+	if (!gmtime_r(&seconds, &parts)) return "?";
+#endif
 
 	char buf[32];
 	snprintf(buf, sizeof buf, "%04d-%02d-%02d %02d:%02d:%02d",
