@@ -6,7 +6,7 @@
 
 #include "common.h"
 #include "env.h"
-#include "nn.h"
+#include "cmlp_adapter.h"
 
 class agent
 {
@@ -20,6 +20,7 @@ public:
 		const std::vector<xfloat>& /*next*/, bool /*done*/) {}
 
 	virtual void begin_episode() {}
+	virtual void end_epoch() {}
 	virtual bool learns() const { return false; }
 	virtual xfloat exploration() const { return 0.0; }
 	virtual xfloat recent_loss() const { return 0.0; }
@@ -61,13 +62,30 @@ private:
 class crossover_agent final : public agent
 {
 public:
-	explicit crossover_agent(const xfloat threshold) : threshold_(threshold) {}
+	crossover_agent(const xfloat threshold, const int trend_column) : threshold_(threshold), trend_column_(trend_column) {}
 
 	std::string name() const override { return "crossover"; }
 	int act(const std::vector<xfloat>& state, bool greedy) override;
 
 private:
 	xfloat threshold_;
+	int trend_column_;
+};
+
+// Hand-coded form of the one effect that survived the pattern study: drift is
+// positive above the previous session's high. Exists so the learner has to beat
+// it, not because a fixed rule is the goal.
+class breakout_agent final : public agent
+{
+public:
+	breakout_agent(const xfloat threshold, const int high_column) : threshold_(threshold), high_column_(high_column) {}
+
+	std::string name() const override { return "breakout"; }
+	int act(const std::vector<xfloat>& state, bool greedy) override;
+
+private:
+	xfloat threshold_;
+	int high_column_;
 };
 
 struct tabular_config
@@ -84,7 +102,7 @@ struct tabular_config
 class tabular_q_agent final : public agent
 {
 public:
-	tabular_q_agent(const tabular_config& config, int feature_columns, uint64_t seed);
+	tabular_q_agent(const tabular_config& config, const feature_matrix& features, uint64_t seed);
 
 	std::string name() const override { return "qtable"; }
 	int act(const std::vector<xfloat>& state, bool greedy) override;
@@ -105,6 +123,7 @@ private:
 
 	tabular_config config_;
 	int feature_columns_;
+	int trend_column_, return_column_, volatility_column_;
 	std::vector<xfloat> q_;
 	std::vector<int32_t> visits_;
 	rng rng_;
@@ -116,6 +135,7 @@ struct dqn_config
 {
 	std::vector<int> hidden = { 64, 64 };
 	xfloat learning_rate = 3e-4;
+	xfloat lr_decay = 1.0;           // applied after each training epoch; 1.0 is off
 	xfloat discount = 0.99;
 	xfloat epsilon_start = 1.0;
 	xfloat epsilon_end = 0.05;
@@ -127,6 +147,9 @@ struct dqn_config
 	int train_every = 4;
 	int target_sync = 2000;
 	xfloat huber_delta = 1.0;
+	// Q error is larger than the cost of switching, so argmax flips on noise.
+	// Requiring the edge to cover the move is the correct decision rule; 0 is off.
+	xfloat switch_margin = 0.0;
 };
 
 // Double DQN with experience replay and a target network.
@@ -140,21 +163,23 @@ public:
 	void observe(const std::vector<xfloat>& state, int action, xfloat reward,
 		const std::vector<xfloat>& next, bool done) override;
 
+	void end_epoch() override;
 	bool learns() const override { return true; }
 	xfloat exploration() const override;
 	xfloat recent_loss() const override { return loss_; }
 	bool save(const std::string& path) const override { return online_.save(path); }
 
 	int parameter_count() const { return online_.parameter_count(); }
+	xfloat learning_rate() const { return online_.learning_rate(); }
 
 private:
 	void train_batch();
-	int argmax(const std::vector<xfloat>& q) const;
+	int argmax(const xfloat* q) const;
 
 	dqn_config config_;
 	int state_size_;
-	mlp online_;
-	mlp target_;
+	dqn_network online_;
+	dqn_network target_;
 	rng rng_;
 
 	std::vector<xfloat> states_, next_states_;
@@ -164,9 +189,30 @@ private:
 	int stored_ = 0;
 	int cursor_ = 0;
 
+	// Reused across updates so a training step allocates nothing.
+	std::vector<xfloat> batch_states_, batch_next_, batch_grad_, batch_target_;
+	std::vector<int32_t> batch_index_;
+	std::vector<int> batch_pick_;
+
 	int64_t steps_ = 0;
 	xfloat loss_ = 0.0;
 };
 
-std::unique_ptr<agent> make_agent(const std::string& name, int state_size, int feature_columns,
+// Votes the greedy actions of several independently seeded learners. Averaging
+// seeds is the cheapest variance reduction there is, and it removes the need to
+// pick one seed's policy off the test window.
+class ensemble_agent final : public agent
+{
+public:
+	explicit ensemble_agent(std::vector<agent*> members) : members_(std::move(members)) {}
+
+	std::string name() const override { return "ensemble"; }
+	int act(const std::vector<xfloat>& state, bool greedy) override;
+	void begin_episode() override;
+
+private:
+	std::vector<agent*> members_;
+};
+
+std::unique_ptr<agent> make_agent(const std::string& name, const feature_matrix& features,
 	const dqn_config& dqn, const tabular_config& tabular, uint64_t seed);

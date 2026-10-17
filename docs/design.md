@@ -1,410 +1,377 @@
-# spq — design
+# price-app - design
 
-spq answers one question: can an agent learn, from ETH/USD trade data alone,
-when to be long and when to be short, and keep the edge after costs?
+price-app is an offline, single-instrument **price-action position predictor**.
+At each decision it chooses short, flat or long from historical prices and its
+current position. It evaluates those decisions chronologically against costs,
+simple agents and controls. It does not output a future price or calibrated
+direction probability.
 
-This document describes the system as it is. Where the code and this document
-disagree, this document is the contract and the code is wrong.
-[Appendix A](#appendix-a--gaps-in-the-original-prototype) records what the
-original prototype got wrong, because that is why several of these rules exist.
+This document describes the implemented contract. [experiments.md](experiments.md)
+contains measured results, not implementation history. Generic data support
+does not establish a predictive edge: the market evidence recorded so far is
+from ETHUSDT/BTCUSDT perpetuals.
 
-The measured answer, on the data tested so far, is **no edge**. See
-[section 10](#10-results).
+## 1. Architecture
 
-## 1. Scope
-
-Two binaries, one job each.
-
-- `cli.exe` **runs experiments.** It is the only thing that builds bars, trains,
-  evaluates or writes results. Headless, deterministic, scriptable.
-- `app.exe` **views data and results.** It reads bars and a run directory and
-  draws them. It never trains and never writes.
-
-That split is what makes results trustworthy: you cannot produce a number by
-clicking around, and you cannot invalidate one by looking at it.
-
-### 1.1 Non-goals
-
-- Live trading, order routing, exchange connectivity.
-- Being a general ML framework. The learner serves this one problem.
-- Portfolio construction across many assets.
-- GPU training. Everything runs on one CPU in minutes.
-
-## 2. Principles
-
-**Zero dependencies.** C++20, the standard library, and Win32. Nothing else
-links in. No package manager, no vendored library, no JSON parser, no charting
-library, no HTTP client. CSV parsing, the optimiser, the metrics and the chart
-renderer are all in `src/`.
-
-**Causality is enforced, not assumed.** No feature, label or reward may read a
-bar later than the one it is computed for. Section 5 describes how that is
-structurally guaranteed and how it is tested.
-
-**Reproducible by construction.** All randomness comes from a seeded generator
-written out in `common.h`, never `std::random_device` and never a standard
-distribution — those are not specified bit-exactly. Release builds use
-`/fp:precise`. Every run records its config, seed and a hash of the bars it
-consumed.
-
-**Text-first artifacts.** Results are CSV and `key=value` text: diffable,
-greppable, readable in a decade. Only network weights are binary, and they carry
-a versioned header.
-
-## 3. Repository layout
-
-```
-docs/design.md          this document — the contract
-README.md               quickstart, delegates here
-AGENTS.md               rules for AI agents, delegates here
-dd.ps1                  download data, build, run
-
-src/                    all source, no external includes
-  common.h/.cpp         types, seeded rng, hashing, string and time helpers
-  bars.h/.cpp           trade CSV -> bars, binary bar file, data hash
-  features.h/.cpp       streaming causal indicators, feature matrix
-  env.h/.cpp            the MDP: state, actions, reward, cost model
-  nn.h/.cpp             the MLP: forward, backward, Adam, save/load
-  agents.h/.cpp         baselines, rule agent, tabular Q, DQN
-  metrics.h/.cpp        per-fold performance measurement
-  run.h/.cpp            run directory artifacts
-  experiment.h/.cpp     walk-forward loop, baselines, controls
-  cli.cpp               experiment runner (console)
-  app.cpp               viewer (Win32)
-  app.manifest          per-monitor v2 DPI awareness
-  cli.vcxproj           -> exe/cli.exe, exe/cli-d.exe
-  app.vcxproj           -> exe/app.exe, exe/app-d.exe
-
-data/                   downloaded and derived data, gitignored
-  raw/ETHUSDT-trades-YYYY-MM-DD.csv
-  bars/ETHUSDT-10s.bin
-
-runs/                   one directory per experiment, gitignored
-  <run-id>/
-    manifest.txt        config, seed, data hash, fold layout
-    metrics.csv         one row per variant, seed, cost level and fold
-    equity.csv          time, price, position, gross, cost, equity
-    learning.csv        episode, mean reward, epsilon, loss
-    weights.bin         policy parameters (policy.csv for the tabular agent)
-
-exe/                    build output, gitignored
-intermediate/           build intermediates, gitignored
-```
-
-Only source and documents are committed.
-
-## 4. Data
-
-### 4.1 Source
-
-Binance public data, USD-M futures daily trade files from `data.binance.vision`.
-Each row is one executed trade:
-
-```
-id,price,qty,quote_qty,time,is_buyer_maker
-4225178877,3534.3,0.48,1696.464,1721606402850,false
-```
-
-`is_buyer_maker=false` means the buyer was the aggressor, which gives take-side
-for free and is a real microstructure signal.
-
-`dd.ps1 data` downloads, verifies the published SHA256 and unzips into
-`data/raw/`. Downloading is the only thing that touches the network, and it is a
-separate explicit step — no binary ever fetches anything.
-
-### 4.2 Trades are not the modelling unit
-
-Raw trades arrive irregularly, and the arrival rate is itself information.
-Indexing by trade *count* silently changes the time scale between quiet and busy
-periods, so "a 733-trade moving average" means something different at 03:00 than
-at 14:30. The pipeline is therefore:
-
-```
-raw trades  ->  bars  ->  features  ->  agent
-```
-
-`cli bars` streams the CSVs once and aggregates into fixed-interval bars: open,
-high, low, close, base volume, quote volume, aggressor buy volume and trade
-count. Intervals with no trades are emitted as filled bars carrying the previous
-close forward, so the time axis stays regular. Bars are written to a compact
-binary file with a header; no later stage re-parses CSV.
-
-Volume and dollar bars would normalise information arrival better than clock
-time. Not built.
-
-### 4.3 Features
-
-Thirteen features per bar, all causal and all scale-free — the agent must not be
-able to tell $3,700 ETH from $1,800 ETH, or it will memorise the regime instead
-of learning the behaviour.
-
-| # | Name | Form |
-|---|---|---|
-| 0–4 | `ret_1` … `ret_300` | `log(c_t / c_{t-k})` for k in {1,5,15,60,300}, divided by realised vol × √k |
-| 5 | `trend_fast` | `(ema_12 − ema_48) / atr` |
-| 6 | `trend_slow` | `(ema_48 − ema_192) / atr` |
-| 7 | `vol_ratio` | `log(rv_60 / rv_1440)` |
-| 8 | `range_pos` | position of close in its 300-bar range, centred on zero |
-| 9 | `flow` | `(2 × aggressor buys − volume) / volume` over 60 bars |
-| 10 | `activity` | trade count over 60 bars against its long-run rate |
-| 11–12 | `tod_sin`, `tod_cos` | time of day |
-
-Features 0–7, 9 and 10 are then standardised with **expanding** statistics
-(Welford, past only) and clamped to ±5. Bounded and periodic columns are left
-alone. Warmup is 1,740 bars; earlier rows are not usable.
-
-The environment appends three more columns at decision time: current position,
-unrealised pnl in ATR units, and bars held. An agent that cannot see its own
-position cannot learn to hold one, and will churn.
-
-## 5. Causality
-
-Getting this wrong once invalidates every number the project has produced, and
-it is invisible in the output. It is defended three ways.
-
-**Streaming-only computation.** Every indicator in `features.h` is an object
-with `push(x) -> value`. It owns its state and never holds the series, so it is
-structurally incapable of indexing forwards. A centred window
-(`sum -= x[i-r]; sum += x[i+r]`) cannot be expressed in that interface. That
-centred window was the original bug.
-
-**Expanding normalisation.** Whole-file mean and variance would leak the future.
-`expanding_stats` only ever sees the past.
-
-**A shift audit.** `cli audit` recomputes every feature over a series truncated
-at `t` and requires the value at `t` to be identical to the full-series value.
-It probes eight points and exits non-zero on any disagreement.
-
-The audit has been verified to fail: injecting a deliberate one-bar shift made
-all eight probes report `LOOK-AHEAD`, with a largest disagreement of 2.62 in
-`ret_1`. A test that has never been seen to fail is not evidence.
-
-## 6. The reinforcement learning problem
-
-### 6.1 Formulation
-
-- **State** — the 13 features at bar `t` plus the three position columns.
-- **Action** — `{short, flat, long}`, the target position for the next bar.
-  Three actions rather than two, because "no opinion" is a real answer and
-  forcing a side manufactures turnover.
-- **Reward**
-
-  ```
-  r_t = pos_t · log(c_{t+1} / c_t) − cost · |pos_t − pos_{t-1}| − λ · |pos_t|
-  ```
-
-  where `cost` is half the round-trip basis points, so flat→long→flat pays the
-  full round trip and long→short also pays one round trip. `λ` is an optional
-  holding penalty, default zero.
-
-- **Episode** — a contiguous slice of bars, default 3,600. Episodes start flat
-  and are forced flat at the end, so no unrealised position is ever banked.
-- **Discount** — 0.99 by default.
-
-The decision at bar `t` is made from information up to bar `t`'s close and earns
-the return from `t` to `t+1`. That ordering is the causality guarantee at the
-environment level.
-
-Rewarding log return rather than raw pnl keeps rewards additive and
-scale-invariant. Rewards are scaled by 10,000 inside the learners so Q-values
-are O(1) rather than O(1e-5); reported metrics stay in true units.
-
-### 6.2 Why RL rather than supervised classification
-
-A supervised "will the next bar be up?" classifier optimises a proxy. It has no
-notion of transaction cost, cannot express "hold through this noise", and treats
-a 0.01% move and a 2% move as the same label. Risk-adjusted return after costs,
-given that you are already in a position, is exactly a sequential decision
-problem. The reward *is* the objective.
-
-The honest counterpoint: RL is sample-hungry and unstable, and the signal is
-faint. That is why the baselines stay in the suite permanently.
-
-### 6.3 Agents
-
-| Agent | What it is |
+| Component | Responsibility |
 |---|---|
-| `flat`, `long`, `short` | Constant position. The bars most strategies quietly fail to clear. |
-| `random` | Flips to a random action with probability 0.02 per bar. The cost floor. |
-| `crossover` | Long above `trend_fast > 0.5`, short below `−0.5`, hold inside the dead band. |
-| `qtable` | Tabular Q-learning over 225 discretised states (trend × 60-bar return × vol × position). Small enough that `policy.csv` prints the whole learned policy. |
-| `dqn` | Double DQN: experience replay (200k), target network synced every 2,000 steps, ε-greedy 1.0→0.05, Huber loss, gradient clipping, Adam. |
+| `cli.exe` | Import/aggregate data, audit features, train and evaluate agents, write runs, report and verify. |
+| `app.exe` | Read-only viewer for bars, predicted positions and equity. |
+| [bars](../src/bars.h) | Canonical OHLCV import, Binance aggregation, versioned bar files, metadata and hashing. |
+| [features](../src/features.h) | Streaming causal indicators and versioned feature matrices. |
+| [environment](../src/env.h) | Position state, next-observed-bar return and costs. |
+| [agents](../src/agents.h) | Constants, rules, tabular Q, DQN and seed voting. |
+| [experiments](../src/experiment.h) | Walk-forward windows, baselines, controls and artifacts. |
+| [patterns](../src/patterns.h) | Bucket studies with permutation and persistence/cost screens. |
 
-The rule is to earn complexity: each rung must beat the one below it
-out-of-sample before the next is worth writing. The linear-Q rung between
-`qtable` and `dqn` was skipped, and is worth revisiting only if the DQN ever
-beats the tabular agent.
+libcmlp owns neural math; libcfindata owns acquisition; spike-db is used only by
+the storage comparison; platform-h belongs only to the viewer. Full revisions
+are recorded in [the dependency manifest](../cmake/dd-dependencies.json).
+The CLI never links platform-h, and Linux does not configure it.
 
-### 6.4 The network
+The viewer never trains, evaluates or writes. Opening a result cannot change
+it. All market acquisition is explicit through `cli download`; experiments,
+verification and tests need no network.
 
-`mlp` in `nn.h` is a fully connected network with ReLU hidden layers, **linear
-outputs** (Q-values are unbounded; a sigmoid would cap them at 1), real bias
-parameters, He initialisation, Adam, global-norm gradient clipping and versioned
-`save`/`load`. Tensors are flat `std::vector<xfloat>`; there are no owning raw
-pointers.
+## 2. Generic data contract
 
-## 7. Evaluation
+### 2.1 Canonical CSV
 
-**Walk-forward, purged.** A train window and a test window roll forward through
-time with a gap between them, so no training bar shares a feature window with a
-test bar. Every fold is reported separately as well as pooled.
-
-**Every variant is evaluated inside the fold loop.** The cost curve and the
-controls see the policy at exactly the stage of learning the headline saw.
-Evaluating the cost curve once at the end with the final policy is wrong; it
-produced visibly inconsistent trade counts before it was fixed.
-
-**Metrics per fold**, all after costs: net and gross log return, cost paid, cost
-as a share of gross, annualised return, Sharpe, Sortino, max drawdown, turnover,
-hit rate, average win and loss, and time in market by side.
-
-Cost-paid-as-a-share-of-gross is the number that kills most high-frequency
-ideas, so it is on the summary line rather than buried.
-
-**Cost sensitivity.** Every run reports 1, 2, 5 and 10 bps round trip. A result
-that only survives at zero cost is a data artifact.
-
-**Seeds.** The learner runs over several seeds and the summary reports the
-median. Single-seed results on financial data are close to noise.
-
-**Controls.** A shuffled-return control runs alongside every experiment: the
-same policy, the same costs, the returns permuted. If it scores as well as the
-real thing, there is no edge. `cli walk` exits non-zero if the control beats the
-real run outright.
-
-Not built: the reversed-signal control, a turnover-matched random control, sweep
-logging with attempt counts, and multiple-testing accounting.
-
-## 8. `cli.exe`
-
-```
-cli bars   --in <dir|file> --out <file> [--interval 10s] [--symbol ETHUSDT]
-cli audit  --bars <file>
-cli walk   --bars <file> [--agent dqn] [--seeds 3] [--train 40000] [--test 10000]
-           [--gap 2000] [--episode 3600] [--epochs 2] [--cost-bps 5]
-           [--hold-penalty 0] [--lr 3e-4] [--hidden 64,64] [--gamma 0.99]
-           [--epsilon-decay 200000] [--batch 32] [--target-sync 2000]
-           [--q-lr 0.1] [--seed 1] [--out runs]
-cli report --run <id> [--root runs]
-cli list   [--root runs]
-cli verify --run <id> [--root runs]
+```text
+cli bars --format ohlcv --in <csv> --out <file> --symbol <instrument>
+         --interval <duration> --calendar <utc|supplied-name> --currency <unit>
+         [--source-name local-csv] [--price-basis raw|adjusted]
 ```
 
-`walk` is the whole experiment: it trains fold by fold, evaluates each held-out
-window, and runs the baselines, the cost curve and the shuffled control
-alongside. `verify` re-hashes the bar file against the manifest and re-runs the
-recorded config.
+Input is a single already-aggregated, headered CSV. Required columns are
+`time,open,high,low,close`. Optional columns are `volume` and `session`.
+Columns may be reordered; unknown or duplicate columns are errors. Plain
+numeric cells are required, not quoted/provider-specific CSV expressions.
+A UTF-8 BOM and whitespace around cells are accepted.
 
-Exit codes: `0` success, `1` a control or the audit failed, `2` bad input.
+| Field | Meaning |
+|---|---|
+| `time` | Bar-open time, nonnegative integer UTC epoch milliseconds. |
+| `open,high,low,close` | Finite positive prices, with `low <= open/close <= high`. |
+| `volume` | Optional finite nonnegative provider quantity. Not an inferred trade count or aggressor flow. |
+| `session` | Required for a supplied calendar: nonnegative, nondecreasing integer IDs, repeated within a session. |
 
-Not built: `cli sweep`, and a config-file surface — everything is flags today.
-`verify` re-runs and reports rather than diffing equity curves.
+`--symbol`, `--interval`, `--calendar` and `--currency` must be explicit. An
+interval is a positive whole duration (`ms`, `s`, `m`, `h`, `d`) up to `365d`.
+Times must increase by at least that interval; duplicates, out-of-order rows,
+overlapping bars, invalid prices and missing numeric cells are rejected before
+publication. An existing generic output file is rejected.
 
-## 9. `app.exe`
+With `--calendar utc`, there is no session column: the session ID is the UTC
+date derived from each timestamp. Any other calendar label requires the input
+session column. That label identifies the producer's convention; there is no
+built-in exchange calendar, timezone conversion, holiday or DST database.
+Supplied IDs can express sessions spanning UTC midnight and changes in UTC
+opening times without splitting a session incorrectly.
 
-A read-only Win32 viewer. It renders with GDI into a DIB section — no GPU
-libraries, no UI toolkit, no charting dependency — and ships a per-monitor-v2
-DPI manifest so text and chart are drawn at real device pixels rather than
-bitmap-stretched.
+The importer preserves observed timestamps and reports gaps. It does not
+resample, fill closures or infer whether a gap is a closure, halt or missing
+data. Coverage and calendar correctness are the producer's responsibility.
+The research horizon is **one observed bar**, not necessarily one nominal
+interval of elapsed time.
 
+Volume availability is explicit. An omitted column is unavailable, not an
+observation of zero liquidity. Neither optional volume nor fabricated flow
+enters the generic feature profile.
+
+### 2.2 Persistent formats
+
+Generic data uses **SPQB v2**. It records the symbol and nominal interval,
+source, currency, calendar label, price basis (`raw` or `adjusted`), volume
+availability, OHLC records and one session ID per bar. The underlying
+72-byte `bar` layout remains unchanged; v2 has an extended header and a parallel
+session vector. Absent quote volume, aggressor volume and trade counts are
+marked unavailable by the format, not presented as observations.
+
+Readers validate v2 metadata, record sizes, timestamps, prices and session
+consistency. The data hash covers metadata and session IDs as well as prices,
+symbol and interval. Changing only the calendar or currency changes identity.
+
+**SPQB v1** is the Binance reproduction format. Its bytes, hashing,
+twenty-feature profile and recorded experiment semantics are retained.
+No file is automatically migrated or overwritten. The spike-db comparison is
+v1-only and rejects v2 rather than discarding its metadata.
+
+### 2.3 Binance data
+
+The dedicated importer detects Binance trades or klines; aggregate-trade
+archives are refused rather than read as trades. Trades aggregate into
+clock slots; empty slots carry the previous close. Klines can only aggregate
+to whole multiples of their source interval; they cannot be split. Native
+defaults are 1s for trades and the source interval for klines. Archives must
+not overlap: a repeated or earlier kline, or a trade file starting inside data
+already read, is refused rather than merged. Daily and monthly archives for the
+same dates share a default directory, so this is a routine hazard; once it
+folded a month into one bar and filled the rest with synthetic flat bars.
+
+The reproduction path assumes USD-M millisecond timestamps and base/quote
+volume semantics. Acquisition of spot or coin-margined files is not a claim
+that they satisfy that modelling contract.
+
+libcfindata downloads ZIPs and mandatory SHA256 sidecars, validates archive
+members/limits/CSV schemas, then publishes under per-destination OS locks.
+Explicit fixtures never fall back to the network. Missing checksums fail even
+with `--skip-missing`. Forced downloads retain `.previous`; failures preserve
+staging/backup evidence, and live `.lock` anchors must not be removed.
+Typed rows default to a 10,000,000 limit; byte limits are independent.
+
+## 3. Features and causality
+
+### 3.1 Generic `ohlc-v1` profile
+
+Eleven price-only columns, followed by three position columns:
+
+| Feature | Definition |
+|---|---|
+| `ret_1,ret_5,ret_15,ret_60,ret_300` | Lagged log return, divided by trailing 60-bar realised volatility times the square root of the lag. |
+| `trend_fast` | EMA(12) minus EMA(48), divided by the trailing range scale. |
+| `trend_slow` | EMA(48) minus EMA(192), divided by that scale. |
+| `vol_ratio` | Log ratio of 60-bar to 1,440-bar realised volatility. |
+| `range_pos` | Close within its trailing 300-bar close range, centred on zero. |
+| `pd_range_pos` | Close within the previous completed session's high/low range, centred on zero. |
+| `pd_high_dist` | Distance above the previous completed session high, divided by its range. |
+
+The range scale uses the 48-bar mean relative high-low range, rescaled by the
+current close. It is not an exchange calendar or gap-aware true-range model.
+Generic log returns are differences of logarithms, avoiding an overflowing
+intermediate price ratio.
+
+The first eight columns use causal expanding Welford statistics and a +/-5
+clamp. Range position is bounded; previous-session distances use a +/-2 clamp.
+Warmup is at least **1,740 observed bars** and requires a completed previous
+session. Lookbacks count observations, not calendar minutes. Changing the bar
+interval changes the model's time horizons.
+
+The environment appends current position, unrealised P&L in trailing bar-range
+units, and transformed bars held. Generic observations therefore have fourteen
+columns. Agents bind named features, not fixed offsets.
+
+### 3.2 Binance `binance-v1` profile
+
+The v1 profile has twenty base features: the price features above plus
+aggressor flow, trade-count activity, hourly activity surprise, two harmonics
+of UTC time of day and day-of-week sine/cosine. Position state makes
+twenty-three observation columns. Its UTC-session and continuous-bar
+normalisation/warmup semantics are preserved for reproduction.
+
+### 3.3 Causality guarantee
+
+Indicators consume one completed bar at a time and own only past state.
+Previous-session levels become available at rollover, never before that
+session is complete. Features at decision `t` do not read the return earned
+after `t`. Expanding statistics are causal; no complete test window is fitted
+as a preprocessing dataset.
+
+`cli audit` recomputes features on prefixes at eight probes and compares them
+with the full series. It carries the same format, metadata and truncated
+session IDs into each prefix. Any future read must fail. Both profiles have
+been tested with deliberately injected one-bar look-ahead; see the experiment
+record.
+
+## 4. Position prediction and learning
+
+Actions are target positions `{short=-1, flat=0, long=1}`. A decision uses the
+completed bar's features and current position. Its payoff is the signed log
+return from that close to the next observed close. It is not available at the
+bar-open timestamp stored in the data.
+
+For the generic path:
+
+```text
+gross = position * (log(next_close) - log(close))
+one_way_cost = round_trip_bps / 2 / 10000 + slippage_bps / 10000
+reward = gross - one_way_cost * abs(position_change)
+         - holding_penalty * abs(position)
 ```
-app.exe --bars data/bars/ETHUSDT-10s.bin --run runs/<id>
-```
 
-Layout, top to bottom:
+Episodes start flat and finish flat. Generic training rewards and reported
+costs both include terminal liquidation. The holding penalty regularises
+learning; it is not a substitute for funding or an actual carrying-cost ledger.
+v1 retains its reproduction training convention; reported metrics include
+liquidation costs in both formats.
 
-- **Header** — symbol, bar file, visible bar range, and a readout of the bar
-  under the cursor: time, price, position, equity.
-- **Price** — one column per pixel, aggregating high and low over the bars that
-  fall in it, so it stays responsive across a million bars.
-- **Position band** — green long, red short, grey flat.
-- **Equity** — the run's cumulative net log return, with the area to zero shaded.
-- **Mini-map** — the whole series in one strip, coloured by position, with the
-  current viewport drawn as a lit window over a dimmed whole.
+Fills are an explicit close-plus-slippage assumption. No execution price is
+chosen from the same bar's high/low. The generic path rejects
+`--cost-activity`, which requires unavailable trade counts. The v1 path
+supports causal trade-count-scaled costs.
 
-Navigation: drag or middle-drag to pan, wheel to zoom about the cursor,
-shift-wheel or horizontal wheel to scroll, click or drag the mini-map to jump,
-Home/End and arrow keys. All layout is DPI-scaled, and the mini-map is cached
-per pixel column so dragging stays smooth on a large series.
+| Agent | Policy |
+|---|---|
+| `flat`, `long`, `short` | Constant position baselines. |
+| `random` | Seeded random target changes with probability 0.02 per bar. |
+| `crossover` | Long above `trend_fast > 0.5`, short below -0.5, otherwise hold. |
+| `breakout` | Long above the previous completed session high, otherwise flat. |
+| `qtable` | Tabular Q-learning over 225 trend/return/volatility/position states. |
+| `dqn` | Double DQN with replay, a target network, Huber derivatives and Adam. |
+| ensemble | Vote of the configured seeds, holding the current position on a tie. |
 
-The viewer runs without arguments and shows a message rather than crashing when
-there are no bars.
+The native default is `dqn`, not an assertion that it is the best predictor.
+Constants and rules must be beaten out of sample before additional complexity
+is justified. Seeds are trained side by side; seed 0 is the fixed saved-policy
+choice, not a seed selected on test performance.
 
-Not built: feature panes, seed-spread display, side-by-side run comparison.
+Features, rewards, replay and metrics are binary64. The DQN uses a move-only
+libcmlp adapter with finite/range/underflow-checked binary32 conversions.
+Its contract is `cmlp-f32-scalar-he-splitmix64-v1`: scalar kernels, He/Xavier
+initialisation, deterministic nonzero seed mapping and Adam with global norm
+clip 10. CMLP checkpoints retain optimiser state. SPQN checkpoints and
+incompatible library revisions are explicitly rejected.
 
-## 10. Results
+## 5. Evaluation
 
-Measured on 5 days of ETHUSDT USD-M futures trades (2024-07-22 to 07-26),
-19,405,116 trades aggregated to 43,200 ten-second bars. Walk-forward, 7 folds,
-12,000 train bars, 500 gap, 4,000 test, 5 bps round trip, DQN over 5 seeds.
-Figures are out-of-sample cumulative log return over the pooled test windows.
+Walk-forward folds contain train, optional validation and test windows, with
+configurable gaps. All lengths count observed bars. Use a nonzero `--valid`
+window for parameter selection; the test table is scored and reported, not
+searched. Compare actual calendar spans when changing interval or market.
+Choose the gap to match the experiment's dependency/purge requirements rather
+than assuming any positive gap eliminates overlapping lookbacks.
 
-| Variant | Net | Sharpe | Max DD | Turnover |
-|---|---|---|---|---|
-| flat | 0.0000 | 0.00 | 0.0000 | 0.000 |
-| long | −0.0570 | −9.70 | 0.1266 | 0.000 |
-| random | −0.1117 | −25.88 | 0.1172 | 0.018 |
-| crossover | −0.1584 | −26.72 | 0.1834 | 0.024 |
-| **dqn (median of 5 seeds)** | **−0.0668** | **−12.07** | 0.1045 | 0.009 |
-| control: shuffled returns | −0.0615 | −11.75 | 0.0793 | 0.008 |
+Every run includes:
 
-**No edge.** Three things make that hard to argue with:
+- Constant/rule baselines, individual seeds and their ensemble.
+- Costs at 1, 2, 5 and 10 bps, plus the requested cost if different.
+- Shuffled-return and rotated-timing headline controls.
+- Per-fold and pooled metrics; validation metrics when requested.
 
-1. **The DQN is indistinguishable from its own control.** Median net −6.7%
-   against −6.2% for the same policy trading a shuffled return stream. All five
-   seeds are negative, in a tight band from −5.7% to −10.0%.
-2. **Positive gross return proves nothing here.** The DQN's gross was +0.5% to
-   +3.4% across seeds — but the *random* agent's gross was +1.4%, and the
-   shuffled control's ranged from −7.9% to +5.0%. The window is a downtrend, so
-   anything with a short bias shows positive gross. The learner's gross sits
-   inside the control's noise band.
-3. **Costs dominate.** The crossover rule earned +1.1% gross and paid 16.9% in
-   costs. At one-second bars it earned +10.6% gross and paid 200%.
+For generic data, the shuffled control only exchanges returns having the same
+elapsed duration, so an overnight return is not substituted for an intraday
+one. The timing control counter-rotates the actual scored returns against the
+unchanged position/cost sequence. This preserves bar exposure, turnover and
+recorded costs, includes every scored transition and never constructs a
+return across a gap between pooled folds. Eight offsets provide the reported
+median-by-Sharpe rotation.
 
-A related observation from the one-second run: with enough training the tabular
-Q agent converges to **flat in 183 of its 210 visited states**. Given the cost
-model, the optimal learned policy is to not trade. That is the correct answer,
-and it is reassuring that a learner finds it unprompted.
+These are diagnostic nulls, not simulated executable alternative strategies.
+They do not establish exchangeability across every regime or model costs that
+the environment omits. The v1 controls retain their recorded convention.
+If the shuffled control beats the real headline outright, `walk` exits 1.
 
-Caveats: five days is a very short sample, one regime, one pair. The annualised
-and Sharpe figures are scaled up from ten-second bars and should be read as
-ordering information, not forecasts.
+Metrics include cumulative net/gross log return, cost paid, annualised log
+return, Sharpe, Sortino, log drawdown, turnover, hit rate and exposure by side.
+When gross is not positive, the console's cost/gross share is undefined and
+prints `-`, not a misleading zero.
 
-## 11. What would be worth trying next
+The console also prints each variant's **break-even round-trip cost**: costs
+are linear in the cost-scaled position units charged (entries, switches and
+liquidations), so the rate consuming the whole gross is exact for flat,
+slipped and activity-scaled models alike. It prints `-` when no nonnegative
+cost pays. The headline is then split by UTC calendar year, or by month when
+the scored span lies within one year, showing the underlying market return,
+net, break-even, and a rotated timing control confined to that period. The
+periods partition the pooled headline exactly. A result carried by one period,
+or decaying across them, is visible without post-processing; the split is a
+diagnostic, never a basis for selecting a period. These console figures are
+derived from in-memory logs and do not change any artifact.
 
-In rough order of expected value:
+For generic files, annualisation uses the effective scored observation rate:
+number of scored transitions divided by their summed elapsed durations,
+scaled to a 365.25-day year. Overnight time counts; unscored train/purge gaps
+do not. Sharpe is descriptive sample scaling, not a forecast or a
+heteroskedasticity correction. Exposure fractions count observed bars, not
+wall-clock time. v1 retains continuous-interval annualisation.
 
-1. **More data.** Five days cannot separate a weak edge from noise. Thirty days
-   at one-minute bars is a better shape than five days at ten seconds.
-2. **Coarser bars.** Cost as a share of gross falls roughly linearly with bar
-   width. One-minute and five-minute bars are the obvious sweep.
-3. **A holding penalty**, to push the agent toward fewer, larger positions
-   rather than trimming the ones it has.
-4. **The missing controls** — reversed signal, and random at matched turnover.
-5. **Feature panes in the viewer**, so a policy can be read against what it saw.
+## 6. Pattern studies
 
-The expected outcome remains that a liquid pair at short horizons has no
-tradeable edge after realistic costs. A bench that establishes that quickly and
-convincingly is doing its job.
+`cli patterns` measures forward drift and previous-direction momentum by
+bucket, against a block-permutation maximum-statistic null. It reports both
+sample halves. `PAYS` requires significance and a position that persists long
+enough to cover the selected round-trip cost; a high t-statistic alone is not
+an edge.
 
-## Appendix A — gaps in the original prototype
+Generic data supports previous-session high/low/close distances and range
+position. Flow, activity, VWAP, impact and UTC-seasonality groupings are
+explicitly unavailable. An explicit `--block N` in observed bars is required;
+there is no inferred 24-hour session. Permutations that cannot move the tested
+grouping, or lack two complete blocks, are `UNTESTED`.
 
-All of these were found in the review that preceded the rewrite. Every one is
-now closed; they are kept because they are why the rules above exist.
+The Binance profile also supports the UTC/participant groupings, with a
+default block of one day of bars. Whole-day blocks cannot test hour-of-day
+effects on a regular series; use a justified alternative block for that study.
 
-| # | Gap | Resolution |
-|---|---|---|
-| 1 | CSV reader called `getline` twice per iteration, dropping every second row | rewritten in `bars.cpp` |
-| 2 | `sscanf_s` format used `;` separators on comma-separated data, leaving `quantity`, `quote` and `time` uninitialised | field-by-field `strtod` parse |
-| 3 | Moving averages were centred (`i-r` to `i+r`) — look-ahead in every feature and in the label | streaming indicators only, enforced by `cli audit` |
-| 4 | All real features were zeroed and the label fed in as an input, so the model learned a tautology | 13 real causal features in `features.cpp` |
-| 5 | Hard-coded absolute path to a file outside the repo; empty-result path was UB | all paths from the command line |
-| 6 | No reinforcement learning: no reward, policy, value function, episodes or exploration | `env.cpp`, `agents.cpp` |
-| 7 | `nn` owned raw `xfloat***`, was implicitly copyable, had uninitialised members | flat `std::vector`, no owning pointers |
-| 8 | Sigmoid output and hidden layers, MSE loss, fixed LR, bias faked by a pinned neuron | ReLU hidden, linear output, real biases, Huber, Adam |
-| 9 | `sigmoid` used `powf(EXP, -x)` with a truncated constant | activation helpers rewritten |
-| 10 | Renderer indexed `trades[x]` per pixel column unchecked; GDI objects leaked | bounds-checked aggregation, cleanup on `WM_DESTROY` |
-| 11 | Cost model was a flat `0.01` in price units | basis points on position change, with a sensitivity curve |
-| 12 | No weight serialisation, no seeding, no splits, no metrics | `mlp::save`, seeded `rng`, walk-forward, `metrics.cpp` |
-| 13 | Build output committed, including OpenSSL DLLs and an orphan `bot.exe` | deleted; `exe/` gitignored |
-| 14 | MNIST constants left in `common.h` | removed |
+## 7. Run artifacts and verification
+
+Each run owns a new directory under the requested output root:
+
+| Artifact | Contents |
+|---|---|
+| `manifest.txt` | Config, seeds, data hash, format, feature names/profile, normalisation and prediction/timing contracts. |
+| `metrics.csv` | Variant, seed, cost, fold and performance metrics. |
+| `equity.csv` | Bar time, price, out-of-sample ensemble position, gross, cost and cumulative net log return. |
+| `learning.csv` | Learner episode reward, exploration and loss, when training occurs. |
+| `policy.csv` / `weights.bin` | First-seed learned policy, where applicable. |
+
+Generic manifests also record source, currency, calendar, price basis,
+availability flags, execution/carry limitations and control conventions.
+Generic price output preserves binary64 significant digits rather than
+rounding very small prices to zero.
+
+`verify` re-hashes the bars and metadata, validates feature meanings as well
+as dimensions, and checks the prediction and market contracts before rerunning
+the configuration under a separate `verify` root. Older v1 runs without the
+new feature metadata use the reproduction path; DQN numerical/library checks
+still apply. Completing is not reproducing: `verify` then compares the rerun's
+`metrics.csv`, `equity.csv`, `learning.csv`, `policy.csv` and `weights.bin`
+byte for byte with each recorded one present, and exits 1 if any differs.
+A recorded run without `metrics.csv` has nothing to verify and is an error.
+
+`report` prints the manifest and pooled metric rows. `list` discovers runs.
+Unknown options, malformed values, incompatible contracts and unavailable
+required fields are errors. Exit codes: 0 completed, 1 failed causality,
+control or reproduction, 2 invalid input or runtime error, including a failed
+artifact write. No exception crosses the CLI boundary.
+
+There is no standalone saved-model inference command: position predictions
+are generated within the offline walk-forward evaluation. The viewer does not
+recompute them.
+
+## 8. Viewer
+
+The platform-h viewer draws price, position bands, equity and an overview strip.
+Drag to pan, wheel to zoom, shift-wheel to scroll, and use the mini-map or
+Home/End/arrow keys to navigate. It uses per-monitor DPI and a cached bitmap
+overview, with no direct Win32 calls.
+
+Equity rows join to bars by **exact timestamps**, not arithmetic slot indices.
+The generic readout includes currency, calendar and price basis and preserves
+small-price visibility. Missing bars, missing runs and invalid options produce
+visible diagnostics. `--offscreen` paints without opening a desktop window.
+
+## 9. Build and validation
+
+Use the immutable dd driver and [README quickstart](../README.md#build-and-test).
+Project build/command declarations live outside the upstream runtime. Release
+keeps `/fp:precise` and `/arch:AVX2`; there is no nondeterministic RNG path.
+
+`.\dd.ps1 test --label crypto --non-interactive` builds and tests both
+configurations. Windows has ten suites: network, market contract, generic
+predictor, publication, acquisition, legacy agents/causality, dd adoption,
+storage and two offscreen viewer suites. Linux has the eight non-viewer suites.
+Fixtures and outputs stay under isolated project-local test artifacts.
+
+Checks cover malformed/gapped inputs, optional volume, session rollover,
+schema/metadata tampering, terminal costs, deterministic agents, cost curves,
+exact legacy baselines, prefix audits and exact viewer alignment. Controlled
+faults must fail before their corresponding checks are accepted as evidence.
+
+## 10. Scope limits
+
+- Positive-price OHLC data, one instrument per run; no close-only or
+  zero/negative-price return contract.
+- No live feeds, brokerage, order routing, portfolio construction or
+  multi-instrument training.
+- No automatic exchange calendar, timezone conversion, data-quality repair or
+  generic resampling.
+- No funding, stock borrow, financing, dividends, contract rolls, margin,
+  liquidity/capacity model or short-sale restrictions. Source adjustments and
+  corporate actions must be understood before interpreting returns.
+- No supervised price/return forecasting, calibrated probabilities or
+  uncertainty intervals.
+- No claim that crypto findings transfer to equities, FX or commodities.
+
+A generic input interface is useful precisely because it allows those
+hypotheses to be tested honestly. It is not a substitute for the tests.

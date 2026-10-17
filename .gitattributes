@@ -1,0 +1,6 @@
+* text=auto
+*.sh text eol=lf
+*.ps1 text eol=crlf
+# Immutable dd 0.2.0 bytes, including all its templates.
+/dd.ps1 -text whitespace=cr-at-eol
+/.dd/** -text whitespace=cr-at-eol

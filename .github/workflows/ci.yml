@@ -1,0 +1,74 @@
+name: Build and test crypto-app
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Keep scratch files in the checkout
+        run: |
+          $scratch = Join-Path $PWD 'tmp'
+          New-Item -ItemType Directory -Force -Path $scratch | Out-Null
+          "TEMP=$scratch", "TMP=$scratch", "TMPDIR=$scratch" | Add-Content $env:GITHUB_ENV
+      - name: Select Windows vcpkg
+        run: |
+          if (-not $env:VCPKG_INSTALLATION_ROOT -or
+              -not (Test-Path (Join-Path $env:VCPKG_INSTALLATION_ROOT 'scripts/buildsystems/vcpkg.cmake'))) {
+            throw 'Runner has no vcpkg toolchain'
+          }
+          "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT", "CI_VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" |
+            Add-Content $env:GITHUB_ENV
+      - name: Cache Windows dependency builds
+        uses: actions/cache@v4
+        with:
+          path: ~/AppData/Local/vcpkg/archives
+          key: vcpkg-${{ runner.os }}-x64-windows-static-md-${{ hashFiles('vcpkg.json', 'CMakePresets.json') }}
+      - name: Validate pinned CMake dependency declarations
+        run: pwsh -NoProfile -File dd.ps1 dep install --non-interactive
+      - name: Check native toolchain and dependencies
+        run: pwsh -NoProfile -File dd.ps1 doctor --non-interactive
+      - name: Restore pinned Windows acquisition dependencies
+        timeout-minutes: 30
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $logDirectory = Join-Path $PWD 'tmp/dd-logs'
+          New-Item -ItemType Directory -Force -Path $logDirectory | Out-Null
+          $baseline = (Get-Content -LiteralPath 'vcpkg.json' -Raw | ConvertFrom-Json).'builtin-baseline'
+          if ($baseline -isnot [string] -or $baseline -cnotmatch '^[0-9a-f]{40}$') {
+            throw 'vcpkg builtin-baseline must be a full 40-character commit.'
+          }
+          & git -C $env:VCPKG_ROOT fetch --no-tags https://github.com/microsoft/vcpkg.git $baseline `
+            2>&1 | Tee-Object -FilePath (Join-Path $logDirectory 'vcpkg-baseline.log')
+          if ($LASTEXITCODE -ne 0) { throw "Pinned vcpkg baseline fetch failed (exit $LASTEXITCODE)." }
+          & git -C $env:VCPKG_ROOT cat-file -e "${baseline}:versions/baseline.json" `
+            2>&1 | Tee-Object -FilePath (Join-Path $logDirectory 'vcpkg-baseline.log') -Append
+          if ($LASTEXITCODE -ne 0) { throw "Pinned vcpkg baseline object is unavailable (exit $LASTEXITCODE)." }
+          & (Join-Path $env:VCPKG_ROOT 'vcpkg.exe') install --triplet=x64-windows-static-md `
+            "--x-manifest-root=$PWD" "--x-install-root=$(Join-Path $PWD 'vcpkg_installed')" `
+            2>&1 | Tee-Object -FilePath (Join-Path $logDirectory 'vcpkg-restore.log')
+          if ($LASTEXITCODE -ne 0) { throw "Pinned vcpkg restore failed (exit $LASTEXITCODE)." }
+      - name: Build and test Debug and Release (offline fixtures and offscreen viewer)
+        run: pwsh -NoProfile -File dd.ps1 test --label crypto --non-interactive
+      - name: Upload failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crypto-app-Windows-diagnostics
+          path: |
+            tmp/**/dd-logs/*.log
+            tmp/**/dd-ctest-*.xml
+            build/**/Testing/Temporary/*.log
+            build/**/CMakeFiles/CMakeConfigureLog.yaml
+            build/**/vcpkg-manifest-install.log
+          if-no-files-found: warn
+          retention-days: 7

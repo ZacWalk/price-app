@@ -11,9 +11,13 @@ void trade_log::clear()
 	gross.clear();
 	cost.clear();
 	equity.clear();
+	elapsed_ms.clear();
+	market_return.clear();
+	units.clear();
 }
 
-void trade_log::add(const int64_t t, const xfloat p, const int32_t pos, const xfloat g, const xfloat c)
+void trade_log::add(const int64_t t, const xfloat p, const int32_t pos, const xfloat g, const xfloat c,
+	const int64_t elapsed, const xfloat underlying_return, const xfloat cost_units)
 {
 	const xfloat previous = equity.empty() ? 0.0 : equity.back();
 	time.push_back(t);
@@ -22,6 +26,9 @@ void trade_log::add(const int64_t t, const xfloat p, const int32_t pos, const xf
 	gross.push_back(g);
 	cost.push_back(c);
 	equity.push_back(previous + g - c);
+	elapsed_ms.push_back(elapsed);
+	market_return.push_back(underlying_return);
+	units.push_back(cost_units);
 }
 
 metrics compute_metrics(const trade_log& log, const int64_t interval_ms)
@@ -64,6 +71,8 @@ metrics compute_metrics(const trade_log& log, const int64_t interval_ms)
 
 		m.gross_return += log.gross[i];
 		m.cost_paid += log.cost[i];
+		m.cost_units += log.units[i];
+		m.market_return += log.market_return[i];
 
 		const int32_t position = log.position[i];
 		if (position > 0) long_bars += 1;
@@ -89,9 +98,12 @@ metrics compute_metrics(const trade_log& log, const int64_t interval_ms)
 	const xfloat variance = m.bars > 1 ? (sum_sq - m.bars * mean * mean) / (m.bars - 1) : 0.0;
 	const xfloat sd = variance > 0.0 ? std::sqrt(variance) : 0.0;
 
-	const xfloat bars_per_year = interval_ms > 0
-		? 365.25 * 24.0 * 60.0 * 60.0 * 1000.0 / static_cast<xfloat>(interval_ms)
-		: 0.0;
+	xfloat elapsed = 0.0;
+	for (const int64_t duration : log.elapsed_ms) elapsed += static_cast<xfloat>(duration);
+	const xfloat year_ms = 365.25 * 24.0 * 60.0 * 60.0 * 1000.0;
+	const xfloat bars_per_year = elapsed > 0.0
+		? year_ms * static_cast<xfloat>(log.size()) / elapsed
+		: (interval_ms > 0 ? year_ms / static_cast<xfloat>(interval_ms) : 0.0);
 
 	m.annual_return = mean * bars_per_year;
 	m.sharpe = sd > 1e-15 ? mean / sd * std::sqrt(bars_per_year) : 0.0;
@@ -113,6 +125,16 @@ metrics compute_metrics(const trade_log& log, const int64_t interval_ms)
 	m.average_loss = loss_count > 0 ? losses / loss_count : 0.0;
 
 	return m;
+}
+
+xfloat breakeven_cost_bps(const metrics& m, const xfloat slippage_bps)
+{
+	if (!(m.gross_return > 0.0) || !(m.cost_units > 0.0)) return std::nan("");
+
+	// Costs are linear in the units charged, so gross / units is the one-way
+	// cost that consumes the whole gross; slippage takes its share first.
+	const xfloat round_trip = 2.0 * 10000.0 * m.gross_return / m.cost_units - 2.0 * slippage_bps;
+	return round_trip > 0.0 ? round_trip : std::nan("");
 }
 
 std::string metrics_header()

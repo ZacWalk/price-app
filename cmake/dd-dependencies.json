@@ -1,0 +1,25 @@
+{
+  "schema": 1,
+  "dependencies": {
+    "libcmlp": {
+      "url": "https://github.com/ZacWalk/libcmlp.git",
+      "commit": "0372c446461ec648545d9e17a621fdf7a1f4e71d",
+      "method": "fetchcontent"
+    },
+    "libcfindata": {
+      "url": "https://github.com/ZacWalk/libcfindata.git",
+      "commit": "154a4179d9bf0872228da3a0f83a7f971c54644c",
+      "method": "fetchcontent"
+    },
+    "spike-db": {
+      "url": "https://github.com/ZacWalk/spike-db.git",
+      "commit": "062c01efceaac261e91bf989d511fcd42ab232fd",
+      "method": "fetchcontent"
+    },
+    "platform-h": {
+      "url": "https://github.com/ZacWalk/platform-h.git",
+      "commit": "9383d73592d16bbb275913c15b96d5f6e907e1f4",
+      "method": "fetchcontent"
+    }
+  }
+}
