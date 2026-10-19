@@ -23,7 +23,7 @@ namespace
 	void check(fg_status status, const fg_error& error)
 	{
 		if (status != FG_OK)
-			throw std::runtime_error(std::string("libcfindata ") + fg_status_name(status) + ": " + error.message);
+			throw std::runtime_error(std::string("download ") + fg_status_name(status) + ": " + error.message);
 	}
 
 	std::chrono::year_month_day date(const std::string& value)
