@@ -20,4 +20,5 @@ vcpkg_installed/
 data/
 runs/
 *.csv
+!/tests/fixtures/binance/*.csv
 *.zip

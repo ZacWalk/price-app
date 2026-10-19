@@ -65,10 +65,17 @@ CLI. In `src/app.cpp`, use `pf::`, not Win32 types or headers.
 
 Four immutable full revisions are declared in
 [cmake/dd-dependencies.json](cmake/dd-dependencies.json): libcmlp owns neural
-math; libcfindata owns network acquisition; spike-db is a storage benchmark
+math; libcfindata owns neutral transport/JSON/CSV/date utilities; spike-db is a storage benchmark
 dependency; platform-h is viewer-only. The storage benchmark is SPQB v1-only:
 never discard v2 metadata to force parity. Do not copy shared-library math,
-HTTP, checksum, ZIP or storage implementations into the application.
+HTTP, parsing or storage implementations into the application.
+
+Binance acquisition is application-owned C11 in `src/binance`, built once as
+`binance_acquisition` and used by `cli download`. Keep its `fg_` contracts and
+`tests/binance_tests.c` regression suite, and use only public libcfindata
+headers. OpenSSL SHA256 verification precedes libarchive extraction and all
+callbacks; retain archive/row limits, exact timestamps/decimals and spot/UM/CM
+semantics. There is no checksum bypass or silent fallback.
 
 The upstream dd 0.2.2 runtime is immutable. Do not edit `dd.ps1` or `.dd/`;
 their hashes are in [docs/dd-upstream.json](docs/dd-upstream.json). Extend

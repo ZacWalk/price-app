@@ -57,16 +57,24 @@ CMake fetches each library at its exact commit and builds it with the project.
 | Library | Commit | Linked into | Purpose | Licence |
 |---|---|---|---|---|
 | [libcmlp](https://github.com/ZacWalk/libcmlp) | `0372c44` | CLI | Multilayer-perceptron math for the DQN agent: binary32 kernels, Adam and checkpoints. | MIT |
-| [libcfindata](https://github.com/ZacWalk/libcfindata) | `1aedf4a` | CLI | Binance archive download from `data.binance.vision`, mandatory SHA256 checks and ZIP/CSV validation. | MIT |
+| [libcfindata](https://github.com/ZacWalk/libcfindata) | `c94529b` | CLI | Neutral C transport, JSON/CSV, exact numbers and calendar helpers used by app-owned acquisition. | MIT |
 | [spike-db](https://github.com/ZacWalk/spike-db) | `062c01e` | Storage benchmark only | Time-series store compared with SPQB bar files. | MIT |
 | [platform-h](https://github.com/ZacWalk/platform-h) | `9383d73` | Viewer only (Windows) | Win32 window, drawing, text, input and DPI layer. | MIT |
 
 ### Third-party packages
 
+Binance acquisition lives in [src/binance](src/binance) as the C11
+`binance_acquisition` target, linked by `cli download`, never the viewer.
+It owns the provider URLs, mandatory SHA256 checks, bounded ZIP extraction and
+typed CSV contracts; libcfindata supplies only the shared neutral utilities.
+The full provider regression suite and byte-stable fixtures live in
+[tests/binance_tests.c](tests/binance_tests.c) and
+[tests/fixtures/binance](tests/fixtures/binance).
+
 | Package | Windows version | Needed by | Purpose | Licence |
 |---|---|---|---|---|
-| [libarchive](https://www.libarchive.org) | 3.8.8, default features off | libcfindata | Reading downloaded ZIP archives. | BSD-2-Clause (most files) |
-| [OpenSSL](https://www.openssl.org) libcrypto | 3.6.4 | libcfindata | SHA256 verification. | Apache-2.0 |
+| [libarchive](https://www.libarchive.org) | 3.8.8, default features off | App-owned Binance acquisition | Reading downloaded ZIP archives. | BSD-2-Clause (most files) |
+| [OpenSSL](https://www.openssl.org) libcrypto | 3.6.4 | App-owned Binance acquisition | SHA256 verification. | Apache-2.0 |
 | [zlib](https://www.zlib.net) | 1.3.2 | libarchive | Deflate decompression. | Zlib |
 | [libcurl](https://curl.se/libcurl/) | Not used | libcfindata on Linux | HTTPS transfers; Windows uses WinHTTP. | curl |
 
@@ -136,6 +144,26 @@ To build against a local checkout of a dependency, configure with
 The setting is cached; clear it or use a fresh build tree to return to the
 pinned download. No sibling checkout is selected implicitly. Build trees
 contain `dependency-fingerprint.txt` identifying the sources used.
+
+### Binance regression checks
+
+`dd.ps1 test --name '^(binance|acquisition)$' --non-interactive` runs the
+provider-level C suite and the existing CLI download tests in both configurations.
+The C suite covers exact spot/UM/CM schemas, stored/deflated ZIP/ZIP64, checksum
+failure, unsafe members, byte/row limits and callback errors without live data.
+
+For a separate Windows ASan run, use an x64 developer terminal:
+
+```powershell
+cmake --preset windows-debug -B build\x64-windows\binance-asan -DFG_SANITIZE=ON "-DCMAKE_C_FLAGS_DEBUG=/Zi /Od /Ob0" -DCRYPTO_BUILD_VIEWER=OFF -DCRYPTO_BUILD_STORAGE_BENCH=OFF
+cmake --build build\x64-windows\binance-asan --target binance_tests
+ctest --test-dir build\x64-windows\binance-asan -R '^binance$' --output-on-failure
+```
+
+The C debug flags omit MSVC's incompatible `/RTC1`. On Linux, use `linux-debug`,
+a separate `build/x64-linux/binance-asan` directory and omit that MSVC flag
+override. `FG_SANITIZE=ON` instruments both the neutral library and the linked
+Binance target with ASan and fatal UBSan on GCC; build only `binance_tests`.
 
 ## Generic OHLC/OHLCV input
 

@@ -4,3 +4,4 @@
 # Immutable dd 0.2.0 bytes, including all its templates.
 /dd.ps1 -text whitespace=cr-at-eol
 /.dd/** -text whitespace=cr-at-eol
+/tests/fixtures/binance/** -text whitespace=cr-at-eol

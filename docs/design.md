@@ -24,7 +24,9 @@ from ETHUSDT/BTCUSDT perpetuals.
 | [experiments](../src/experiment.h) | Walk-forward windows, baselines, controls and artifacts. |
 | [patterns](../src/patterns.h) | Bucket studies with permutation and persistence/cost screens. |
 
-libcmlp owns neural math; libcfindata owns acquisition; spike-db is used only by
+libcmlp owns neural math; libcfindata owns neutral transport/parsing utilities;
+the application's C11 `binance_acquisition` target owns Binance acquisition;
+spike-db is used only by
 the storage comparison; platform-h belongs only to the viewer. Full revisions
 are recorded in [the dependency manifest](../cmake/dd-dependencies.json).
 The CLI never links platform-h, and Linux does not configure it.
@@ -113,8 +115,11 @@ The reproduction path assumes USD-M millisecond timestamps and base/quote
 volume semantics. Acquisition of spot or coin-margined files is not a claim
 that they satisfy that modelling contract.
 
-libcfindata downloads ZIPs and mandatory SHA256 sidecars, validates archive
-members/limits/CSV schemas, then publishes under per-destination OS locks.
+The app-owned [Binance provider](../src/binance/fg_binance.h) downloads ZIPs and
+mandatory SHA256 sidecars and validates archive members/limits/CSV schemas.
+It uses public libcfindata transport/parsing/date helpers, OpenSSL for digest
+verification and libarchive for bounded in-memory extraction. The application
+then publishes under per-destination OS locks.
 Explicit fixtures never fall back to the network. Missing checksums fail even
 with `--skip-missing`. Forced downloads retain `.previous`; failures preserve
 staging/backup evidence, and live `.lock` anchors must not be removed.

@@ -5,6 +5,10 @@
 The original price-app code is distributed under the [MIT license](LICENSE),
 copyright 2019-2026 Zac Walker.
 
+The C11 Binance implementation in [src/binance](src/binance) and its synthetic
+regression fixtures were developed in libcfindata by the same copyright holder
+and remain MIT licensed as application-owned code.
+
 The vendored `dd.ps1` and `.dd/` files come from
 [ZacWalk/dd v0.2.2](https://github.com/ZacWalk/dd/tree/114890d721907dee64651371947f49dd33dad27c).
 Their exact revision and SHA-256 fingerprints are recorded in
