@@ -57,11 +57,11 @@ CMake fetches each library at its exact commit and builds it with the project.
 | Library | Commit | Linked into | Purpose | Licence |
 |---|---|---|---|---|
 | [libcmlp](https://github.com/ZacWalk/libcmlp) | `0372c44` | CLI | Multilayer-perceptron math for the DQN agent: binary32 kernels, Adam and checkpoints. | MIT |
-| [libcfindata](https://github.com/ZacWalk/libcfindata) | `c94529b` | CLI | Neutral C transport, JSON/CSV, exact numbers and calendar helpers used by app-owned acquisition. | MIT |
+| [libcfindata](https://github.com/ZacWalk/libcfindata) | `d0eed9d` | CLI | Neutral C transport, JSON/CSV, exact numbers and calendar helpers used by app-owned acquisition. | MIT |
 | [spike-db](https://github.com/ZacWalk/spike-db) | `062c01e` | Storage benchmark only | Time-series store compared with SPQB bar files. | MIT |
 | [platform-h](https://github.com/ZacWalk/platform-h) | `9383d73` | Viewer only (Windows) | Win32 window, drawing, text, input and DPI layer. | MIT |
 
-### Third-party packages
+### App-owned acquisition
 
 Binance acquisition lives in [src/binance](src/binance) as the C11
 `binance_acquisition` target, linked by `cli download`, never the viewer.
@@ -70,6 +70,8 @@ typed CSV contracts; libcfindata supplies only the shared neutral utilities.
 The full provider regression suite and byte-stable fixtures live in
 [tests/binance_tests.c](tests/binance_tests.c) and
 [tests/fixtures/binance](tests/fixtures/binance).
+
+### Third-party packages
 
 | Package | Windows version | Needed by | Purpose | Licence |
 |---|---|---|---|---|
