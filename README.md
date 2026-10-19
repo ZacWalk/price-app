@@ -57,7 +57,7 @@ CMake fetches each library at its exact commit and builds it with the project.
 | Library | Commit | Linked into | Purpose | Licence |
 |---|---|---|---|---|
 | [libcmlp](https://github.com/ZacWalk/libcmlp) | `0372c44` | CLI | Multilayer-perceptron math for the DQN agent: binary32 kernels, Adam and checkpoints. | MIT |
-| [libcfindata](https://github.com/ZacWalk/libcfindata) | `154a417` | CLI | Binance archive download from `data.binance.vision`, mandatory SHA256 checks and ZIP/CSV validation. | MIT |
+| [libcfindata](https://github.com/ZacWalk/libcfindata) | `1aedf4a` | CLI | Binance archive download from `data.binance.vision`, mandatory SHA256 checks and ZIP/CSV validation. | MIT |
 | [spike-db](https://github.com/ZacWalk/spike-db) | `062c01e` | Storage benchmark only | Time-series store compared with SPQB bar files. | MIT |
 | [platform-h](https://github.com/ZacWalk/platform-h) | `9383d73` | Viewer only (Windows) | Win32 window, drawing, text, input and DPI layer. | MIT |
 

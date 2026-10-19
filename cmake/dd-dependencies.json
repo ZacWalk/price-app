@@ -8,7 +8,7 @@
     },
     "libcfindata": {
       "url": "https://github.com/ZacWalk/libcfindata.git",
-      "commit": "154a4179d9bf0872228da3a0f83a7f971c54644c",
+      "commit": "1aedf4a8cd4dc89549566e24e0f4c2da5eba412c",
       "method": "fetchcontent"
     },
     "spike-db": {
