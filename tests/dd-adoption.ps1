@@ -83,6 +83,21 @@ if ((Get-Content src/download.cpp -Raw) -notmatch 'fg_binance_download' -or
     (Get-Content cmake/project-command.ps1 -Raw) -match 'Invoke-WebRequest|Expand-Archive|Test-Checksum') {
     throw 'Old PowerShell acquisition was not replaced'
 }
+$cmake = Get-Content CMakeLists.txt -Raw
+foreach ($contract in @('add_library(binance_acquisition STATIC src/binance/fg_binance.c)',
+    'target_link_libraries(binance_acquisition PUBLIC cfindata PRIVATE LibArchive::LibArchive OpenSSL::Crypto)',
+    'target_link_libraries(crypto_cli PRIVATE crypto_core binance_acquisition)',
+    'target_link_libraries(download_offline_probe PRIVATE crypto_core binance_acquisition)',
+    'NAME binance COMMAND binance_tests')) {
+    $checks++
+    if (-not $cmake.Contains($contract)) { throw "App-owned Binance contract missing: $contract" }
+}
+$checks++
+if ((Get-Content src/binance/fg_binance.c -Raw) -match 'fg_sources_internal|fg_sec_internal' -or
+    (Get-Content src/download.cpp -Raw) -notmatch '#include "binance/fg_binance.h"' -or
+    (Get-Content .gitattributes -Raw) -notmatch '/tests/fixtures/binance/\*\* -text') {
+    throw 'Binance must use public neutral APIs and byte-stable app-owned fixtures'
+}
 # Controlled negative: a byte change in a private copy must break the same hash contract.
 $copy = Join-Path $scratch ('dd-' + [Guid]::NewGuid().ToString('N') + '.ps1')
 Copy-Item dd.ps1 $copy
